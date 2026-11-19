@@ -790,8 +790,9 @@ launch or preview was run for this documentation correction.
   `CleanRoomAnalyse`, `CleanRoomQuestion`) are refused in `validate_access`, Deep questions run
   fresh without forking the builder's session (`questions_fork_session() == false`), and Deep
   questions/analyses disable extensions and restrict tools (`--no-extensions --tools
-  read,grep,find,ls`, plus `--no-session --no-mcp` for questions, with tool/extension/session
-  overrides stripped and validated under the restricted profile). It does
+  read,grep,find,ls`, with tool/extension overrides stripped and validated under the restricted
+  profile; Deep questions also pass `--no-session --no-mcp` and strip saved `--session` overrides,
+  whereas Deep analyses retain `--session`). It does
   not pass our MCP server per run (setup uses `~/.pi/agent/mcp.json`) or forward mid-turn
   approvals. Unit tests cover args, restricted overrides, `validate_access`,
   `validate_model_for_access`, RPC/tabular model parsing, option conflicts (`--model`, `--thinking`,
