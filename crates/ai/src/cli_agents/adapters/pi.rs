@@ -342,6 +342,7 @@ impl AgentAdapter for Pi {
         access: Access,
         stop: &Stop,
     ) -> Result<(), ToolError> {
+        self.validate_access(access)?;
         if matches!(access, Access::Build) {
             return self.validate_model(config, options, directory, stop);
         }
@@ -366,15 +367,16 @@ impl AgentAdapter for Pi {
         Ok(())
     }
 
-    /// Pi runs its own tools and extensions without asking Craft Anything first, so Clean room
-    /// builds and analyses cannot enforce Craft Anything's approval policy.
+    /// Pi reads project startup prompt/config files and runs its own tools and extensions without
+    /// asking Craft Anything first, so Clean room runs cannot enforce Craft Anything's no-read
+    /// approval policy.
     fn validate_access(&self, access: Access) -> Result<(), ToolError> {
         match access {
-            Access::CleanRoomBuild | Access::CleanRoomAnalyse => {
-                Err(ToolError::invalid("Pi runs its own tools and extensions without asking Craft Anything first, so Clean room can't hold it back.")
+            Access::CleanRoomBuild | Access::CleanRoomAnalyse | Access::CleanRoomQuestion => {
+                Err(ToolError::invalid("Pi reads startup files and runs its own tools without asking Craft Anything first, so Clean room can't hold it back.")
                     .with_remediation("Switch to Deep mode to use Pi, or choose an agent that checks reads and edits with Craft Anything."))
             }
-            Access::Build | Access::Analyse | Access::Question | Access::CleanRoomQuestion => Ok(()),
+            Access::Build | Access::Analyse | Access::Question => Ok(()),
         }
     }
 
@@ -642,9 +644,9 @@ mod tests {
         assert!(Pi.validate_access(Access::Build).is_ok());
         assert!(Pi.validate_access(Access::Analyse).is_ok());
         assert!(Pi.validate_access(Access::Question).is_ok());
-        assert!(Pi.validate_access(Access::CleanRoomQuestion).is_ok());
         assert!(Pi.validate_access(Access::CleanRoomBuild).is_err());
         assert!(Pi.validate_access(Access::CleanRoomAnalyse).is_err());
+        assert!(Pi.validate_access(Access::CleanRoomQuestion).is_err());
 
         let extra = vec![
             "-e".into(),
@@ -826,6 +828,7 @@ echo '{"type":"response","command":"get_available_models","success":true,"data":
             ..Default::default()
         };
         assert!(Pi.validate_model_for_access(&config, &options, None, Access::Build, &Stop::default()).is_ok());
+        assert!(Pi.validate_model_for_access(&config, &options, None, Access::Analyse, &Stop::default()).is_err());
         assert!(Pi.validate_model_for_access(&config, &options, None, Access::Question, &Stop::default()).is_err());
         assert!(Pi.validate_model_for_access(&config, &options, None, Access::CleanRoomQuestion, &Stop::default()).is_err());
     }

@@ -1132,11 +1132,11 @@ Owner: open · Status: in progress
       the 2.x one, and confirm a live OpenCode 2 build end to end (#1111 stays open until then)
 - [x] Pi (`pi --mode json`) as a coding agent: detection, per-model thinking discovery via
       `get_available_models` RPC (`--offline`, with `--list-models` fallback), `--session` resume,
-      Clean room build/analysis refusal in `validate_access`, read-only question/analysis tool
-      and extension limits (`--no-mcp`, `--no-extensions`, `--no-context-files` for Clean room
-      questions, stripped overrides, access-profile model validation, fresh question source), and
-      JSONL stream parsing for text deltas, tools, turn + compaction usage/cost, retries, deferred
-      settlement errors/truncations and missing sessions.
+      Clean room run refusal (`CleanRoomBuild`, `CleanRoomAnalyse`, `CleanRoomQuestion`) in
+      `validate_access`, Deep read-only question/analysis tool and extension limits (`--no-mcp`,
+      `--no-extensions`, stripped overrides, access-profile model validation, fresh question
+      source), and JSONL stream parsing for text deltas, tools, turn + compaction usage/cost,
+      retries, deferred settlement errors/truncations and missing sessions.
       Verified with unit tests and live `pi` 1.5.2 checks (`ai test Pi`, `ai model Pi`, and
       `--mode json` stdin run); a full live `rebuild` and SSH runs were not run yet
       — claimed: Nghiathan13, branch feature/r2.2-pi-agent

@@ -786,12 +786,12 @@ launch or preview was run for this documentation correction.
 - Pi (`pi --mode json`, roadmap R2.2) is offered when `pi` is installed, detected by Detect, and
   reads prompts from stdin. `pi --mode rpc --no-session --offline` (`get_available_models`, with
   `--offline --list-models` fallback) populates the shared model/thinking picker using each
-  model's `thinkingLevelMap`, `--session <id>` resumes builds, Clean room builds and analyses
-  are refused in `validate_access`, questions run fresh without forking the builder's session
-  (`questions_fork_session() == false`), and questions/Deep analyses disable extensions and
-  restrict tools (`--no-extensions --tools read,grep,find,ls` for Deep, plus `--no-session
-  --no-mcp` for questions and `--no-tools --no-context-files` for Clean room questions, with
-  tool/extension/session overrides stripped and validated under the restricted profile). It does
+  model's `thinkingLevelMap`, `--session <id>` resumes builds, Clean room runs (`CleanRoomBuild`,
+  `CleanRoomAnalyse`, `CleanRoomQuestion`) are refused in `validate_access`, Deep questions run
+  fresh without forking the builder's session (`questions_fork_session() == false`), and Deep
+  questions/analyses disable extensions and restrict tools (`--no-extensions --tools
+  read,grep,find,ls`, plus `--no-session --no-mcp` for questions, with tool/extension/session
+  overrides stripped and validated under the restricted profile). It does
   not pass our MCP server per run (setup uses `~/.pi/agent/mcp.json`) or forward mid-turn
   approvals. Unit tests cover args, restricted overrides, `validate_access`,
   `validate_model_for_access`, RPC/tabular model parsing, option conflicts (`--model`, `--thinking`,
