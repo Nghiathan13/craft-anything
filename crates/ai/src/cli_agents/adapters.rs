@@ -76,6 +76,17 @@ pub trait AgentAdapter: Send + Sync {
     fn validate_model(&self, _config: &BackendConfig, _options: &BackendOptions, _directory: Option<&Path>, _stop: &Stop) -> Result<(), ToolError> {
         Ok(())
     }
+    /// Check a saved choice under the run's access profile (which may disable provider extensions).
+    fn validate_model_for_access(
+        &self,
+        config: &BackendConfig,
+        options: &BackendOptions,
+        directory: Option<&Path>,
+        _access: Access,
+        stop: &Stop,
+    ) -> Result<(), ToolError> {
+        self.validate_model(config, options, directory, stop)
+    }
     /// Refuse options that the native transport cannot support, before preflight or process I/O.
     /// Saving a model choice and discovering its catalogue do not imply native execution support.
     /// `cwd` is the folder the agent will run in on this computer.
@@ -189,6 +200,10 @@ pub trait AgentAdapter: Send + Sync {
     /// It can continue a saved session.
     fn resumes(&self) -> bool {
         false
+    }
+    /// A question can safely fork the builder's saved session instead of running fresh.
+    fn questions_fork_session(&self) -> bool {
+        self.resumes()
     }
     /// It honours [`ArgsCx::question`]: it can be held to reading only, using a fresh session
     /// or leaving a resumed session unchanged. Questions go only to adapters that say so.

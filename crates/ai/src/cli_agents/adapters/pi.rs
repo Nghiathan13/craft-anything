@@ -63,7 +63,7 @@ pub(crate) fn discovery_resource_args(extra: &[String]) -> Vec<String> {
 }
 
 /// Remove saved flags that could bypass tool, extension, or session limits in restricted runs.
-pub(crate) fn strip_restricted_args(extra: &[String], question: bool, reads_checked: bool) -> Vec<String> {
+pub(crate) fn strip_restricted_args(extra: &[String], question: bool, no_extensions: bool) -> Vec<String> {
     let mut out = Vec::new();
     let mut i = 0;
     while let Some(arg) = extra.get(i) {
@@ -78,7 +78,7 @@ pub(crate) fn strip_restricted_args(extra: &[String], question: bool, reads_chec
             i += 1;
             continue;
         }
-        if reads_checked {
+        if no_extensions {
             if let Some(takes_next) = match_value_flag(arg, &["--extension", "-e"]) {
                 if takes_next && extra.get(i + 1).is_some() {
                     i += 1;
@@ -274,16 +274,15 @@ fn accumulate_usage(p: &mut StreamParser, usage: &Value) {
 
 fn assistant_error_text(msg: &Value) -> Option<String> {
     let stop = msg.get("stopReason").and_then(Value::as_str).unwrap_or_default();
-    if !matches!(stop, "error" | "aborted") {
+    if !matches!(stop, "error" | "aborted" | "length") {
         return None;
     }
-    Some(
-        msg.get("errorMessage")
-            .and_then(Value::as_str)
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or(if stop == "aborted" { "run aborted" } else { "run failed" })
-            .to_string(),
-    )
+    let fallback = match stop {
+        "aborted" => "run aborted",
+        "length" => "response reached the model's output limit and was cut short",
+        _ => "run failed",
+    };
+    Some(msg.get("errorMessage").and_then(Value::as_str).filter(|s| !s.trim().is_empty()).unwrap_or(fallback).to_string())
 }
 
 impl AgentAdapter for Pi {
@@ -335,12 +334,34 @@ impl AgentAdapter for Pi {
         models::validate(options, &self.model_catalog(config, options, directory, stop)?)
     }
 
+    fn validate_model_for_access(
+        &self,
+        config: &BackendConfig,
+        options: &BackendOptions,
+        directory: Option<&Path>,
+        access: Access,
+        stop: &Stop,
+    ) -> Result<(), ToolError> {
+        if matches!(access, Access::Build) {
+            return self.validate_model(config, options, directory, stop);
+        }
+        let mut restricted = options.clone();
+        restricted.args = strip_restricted_args(&options.args, matches!(access, Access::Question | Access::CleanRoomQuestion), true);
+        if !restricted.args.iter().any(|a| matches!(a.as_str(), "--no-extensions" | "-ne")) {
+            restricted.args.push("--no-extensions".into());
+        }
+        self.validate_model(config, &restricted, directory, stop)
+    }
+
     fn check_native_options(&self, options: &BackendOptions, _cwd: Option<&Path>) -> Result<(), ToolError> {
         if options.cli_model.is_some() && (has_flag(&options.args, "--model", None) || has_flag(&options.args, "--provider", None)) {
             return Err(ToolError::invalid("Choose Pi's model in its model setting, rather than in extra arguments."));
         }
         if options.cli_thinking.is_some() && has_flag(&options.args, "--thinking", None) {
             return Err(ToolError::invalid("Choose Pi's thinking depth in its thinking setting, rather than in extra arguments."));
+        }
+        if has_flag(&options.args, "--mode", None) {
+            return Err(ToolError::invalid("Pi's output mode is set by Craft Anything, so remove --mode from extra arguments."));
         }
         Ok(())
     }
@@ -359,16 +380,18 @@ impl AgentAdapter for Pi {
 
     fn args(&self, cx: &ArgsCx) -> Vec<String> {
         let mut a = vec!["--mode".to_string(), "json".to_string()];
+        let restricted = !cx.builder || cx.question || cx.reads_checked;
         if cx.question {
-            a.extend(["--no-session".into(), "--no-mcp".into()]);
+            a.extend(["--no-session".into(), "--no-mcp".into(), "--no-extensions".into()]);
             if cx.reads_checked {
-                a.extend(["--no-tools".into(), "--no-extensions".into()]);
+                a.extend(["--no-tools".into(), "--no-context-files".into()]);
             } else {
                 a.extend(["--tools".into(), "read,grep,find,ls".into()]);
             }
         } else if !cx.builder {
+            a.push("--no-extensions".into());
             if cx.reads_checked {
-                a.extend(["--no-session".into(), "--no-mcp".into(), "--no-tools".into(), "--no-extensions".into()]);
+                a.extend(["--no-session".into(), "--no-mcp".into(), "--no-tools".into(), "--no-context-files".into()]);
             } else {
                 a.extend(["--tools".into(), "read,grep,find,ls".into()]);
             }
@@ -382,8 +405,8 @@ impl AgentAdapter for Pi {
         if let Some(r) = cx.resume.filter(|_| !cx.question) {
             a.extend(["--session".into(), r.to_string()]);
         }
-        if !cx.builder || cx.question || cx.reads_checked {
-            a.extend(strip_restricted_args(&cx.options.args, cx.question, cx.reads_checked));
+        if restricted {
+            a.extend(strip_restricted_args(&cx.options.args, cx.question, true));
         } else {
             a.extend(cx.options.args.iter().cloned());
         }
@@ -404,6 +427,10 @@ impl AgentAdapter for Pi {
 
     fn resumes(&self) -> bool {
         true
+    }
+
+    fn questions_fork_session(&self) -> bool {
+        false
     }
 
     fn answers_questions(&self) -> bool {
@@ -530,6 +557,7 @@ impl AgentAdapter for Pi {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::BackendKind;
 
     fn args(builder: bool, reads_checked: bool, question: bool, resume: Option<&str>, options: &BackendOptions) -> Vec<String> {
         let mcp = McpCommand { command: "craft-anything-cli".into(), args: vec!["mcp".into()], notes: None };
@@ -540,10 +568,19 @@ mod tests {
     fn pi_args_cover_modes_models_and_sessions() {
         let default_opts = BackendOptions::default();
         assert_eq!(args(true, false, false, None, &default_opts), ["--mode", "json"]);
-        assert_eq!(args(false, false, false, None, &default_opts), ["--mode", "json", "--tools", "read,grep,find,ls"]);
-        assert_eq!(args(false, true, false, None, &default_opts), ["--mode", "json", "--no-session", "--no-mcp", "--no-tools", "--no-extensions"]);
-        assert_eq!(args(false, false, true, Some("sess-1"), &default_opts), ["--mode", "json", "--no-session", "--no-mcp", "--tools", "read,grep,find,ls"]);
-        assert_eq!(args(false, true, true, Some("sess-1"), &default_opts), ["--mode", "json", "--no-session", "--no-mcp", "--no-tools", "--no-extensions"]);
+        assert_eq!(args(false, false, false, None, &default_opts), ["--mode", "json", "--no-extensions", "--tools", "read,grep,find,ls"]);
+        assert_eq!(
+            args(false, true, false, None, &default_opts),
+            ["--mode", "json", "--no-extensions", "--no-session", "--no-mcp", "--no-tools", "--no-context-files"]
+        );
+        assert_eq!(
+            args(false, false, true, Some("sess-1"), &default_opts),
+            ["--mode", "json", "--no-session", "--no-mcp", "--no-extensions", "--tools", "read,grep,find,ls"]
+        );
+        assert_eq!(
+            args(false, true, true, Some("sess-1"), &default_opts),
+            ["--mode", "json", "--no-session", "--no-mcp", "--no-extensions", "--no-tools", "--no-context-files"]
+        );
 
         let configured = BackendOptions {
             cli_model: Some("opencode-go/deepseek-v4.1-flash".into()),
@@ -555,7 +592,7 @@ mod tests {
             args(true, false, false, Some("sess-1"), &configured),
             ["--mode", "json", "--model", "opencode-go/deepseek-v4.1-flash", "--thinking", "off", "--session", "sess-1", "--no-extensions", "-t", "read,bash"]
         );
-        assert!(Pi.resumes() && Pi.answers_questions() && Pi.prompt_on_stdin() && Pi.has_model_catalog());
+        assert!(Pi.resumes() && !Pi.questions_fork_session() && Pi.answers_questions() && Pi.prompt_on_stdin() && Pi.has_model_catalog());
         assert_eq!(Pi.stdin_text("PRE ", "hi"), "PRE hi");
         assert!(AgentAdapters::built_in().for_agent("pi").ids().contains(&"pi"));
     }
@@ -588,41 +625,15 @@ mod tests {
         };
         assert_eq!(
             args(false, false, true, Some("sess-1"), &saved),
-            [
-                "--mode",
-                "json",
-                "--no-session",
-                "--no-mcp",
-                "--tools",
-                "read,grep,find,ls",
-                "-e",
-                "./custom.ts",
-                "--extension=./other.ts",
-                "--approve",
-                "--offline"
-            ]
+            ["--mode", "json", "--no-session", "--no-mcp", "--no-extensions", "--tools", "read,grep,find,ls", "--offline"]
         );
         assert_eq!(
             args(false, true, true, Some("sess-1"), &saved),
-            ["--mode", "json", "--no-session", "--no-mcp", "--no-tools", "--no-extensions", "--offline"]
+            ["--mode", "json", "--no-session", "--no-mcp", "--no-extensions", "--no-tools", "--no-context-files", "--offline"]
         );
         assert_eq!(
             args(false, false, false, None, &saved),
-            [
-                "--mode",
-                "json",
-                "--tools",
-                "read,grep,find,ls",
-                "-e",
-                "./custom.ts",
-                "--extension=./other.ts",
-                "--approve",
-                "--session",
-                "old-sess",
-                "--session-id=123",
-                "-c",
-                "--offline",
-            ]
+            ["--mode", "json", "--no-extensions", "--tools", "read,grep,find,ls", "--session", "old-sess", "--session-id=123", "-c", "--offline",]
         );
     }
 
@@ -652,12 +663,18 @@ mod tests {
     }
 
     #[test]
-    fn pi_rejects_conflicting_extra_model_and_thinking_flags() {
+    fn pi_rejects_conflicting_extra_model_thinking_and_mode_flags() {
         let model_conflict = BackendOptions { cli_model: Some("p/m".into()), args: vec!["--model".into(), "other".into()], ..Default::default() };
         assert!(Pi.check_native_options(&model_conflict, None).is_err());
 
         let thinking_conflict = BackendOptions { cli_thinking: Some(Effort::High), args: vec!["--thinking=low".into()], ..Default::default() };
         assert!(Pi.check_native_options(&thinking_conflict, None).is_err());
+
+        let mode_conflict = BackendOptions { args: vec!["--mode".into(), "text".into()], ..Default::default() };
+        assert!(Pi.check_native_options(&mode_conflict, None).is_err());
+
+        let mode_eq_conflict = BackendOptions { args: vec!["--mode=rpc".into()], ..Default::default() };
+        assert!(Pi.check_native_options(&mode_eq_conflict, None).is_err());
 
         let clean =
             BackendOptions { cli_model: Some("p/m".into()), cli_thinking: Some(Effort::High), args: vec!["--no-extensions".into()], ..Default::default() };
@@ -755,13 +772,61 @@ mod tests {
         assert!(p2.saw_result && p2.failure.is_some());
 
         // Process exiting cleanly without agent_settled still flushes a pending error.
-        let mut p3 = StreamParser::new(adapter);
+        let mut p3 = StreamParser::new(adapter.clone());
         assert!(p3.line(r#"{"type":"agent_end","willRetry":false,"messages":[{"role":"assistant","stopReason":"aborted"}]}"#).is_empty());
         let evs = p3.finish();
         assert!(matches!(evs.as_slice(), [AgentEvent::Error { message, .. }] if message == "Pi: run aborted"));
         assert!(p3.failure.is_some());
 
+        // Truncated ("length") stopReason fails at settlement if Pi does not recover.
+        let mut p4 = StreamParser::new(adapter.clone());
+        assert!(p4.line(r#"{"type":"agent_end","willRetry":false,"messages":[{"role":"assistant","stopReason":"length"}]}"#).is_empty());
+        assert!(p4.failure.is_none());
+        let evs = p4.line(r#"{"type":"agent_settled","aborted":false}"#);
+        assert!(matches!(evs.as_slice(), [AgentEvent::Error { message, .. }] if message.contains("cut short")));
+        assert!(p4.saw_result && p4.failure.is_some());
+
+        // Truncated ("length") cleared if a later turn recovers before settlement.
+        let mut p5 = StreamParser::new(adapter);
+        assert!(p5.line(r#"{"type":"agent_end","willRetry":false,"messages":[{"role":"assistant","stopReason":"length"}]}"#).is_empty());
+        assert!(p5.line(r#"{"type":"turn_end","message":{"role":"assistant","stopReason":"stop"}}"#).is_empty());
+        assert!(p5.line(r#"{"type":"agent_end","willRetry":false,"messages":[{"role":"assistant","stopReason":"stop"}]}"#).is_empty());
+        assert!(p5.line(r#"{"type":"agent_settled","aborted":false}"#).is_empty());
+        assert!(p5.saw_result && p5.failure.is_none());
+
         assert!(Pi.parse_stderr(&mut p, "No session found matching 'sess-missing'").is_empty());
         assert!(p.session_missing);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_validates_extension_models_against_the_runs_access_profile() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let prog = dir.path().join("pi");
+        let script = r#"#!/bin/sh
+cat >/dev/null
+for a in "$@"; do
+  if [ "$a" = "./ext.ts" ]; then
+    echo '{"type":"response","command":"get_available_models","success":true,"data":{"models":[{"id":"base","name":"Base","provider":"p","reasoning":false},{"id":"ext-only","name":"Ext","provider":"p","reasoning":false}]}}'
+    exit 0
+  fi
+done
+echo '{"type":"response","command":"get_available_models","success":true,"data":{"models":[{"id":"base","name":"Base","provider":"p","reasoning":false}]}}'
+"#;
+        std::fs::write(&prog, script).unwrap();
+        std::fs::set_permissions(&prog, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let config = BackendConfig { name: "Pi".into(), kind: BackendKind::AgentCli, model: "pi".into(), base_url: None, ssh_host: None, enabled: true };
+        let options = BackendOptions {
+            command: Some(prog.display().to_string()),
+            cli_model: Some("p/ext-only".into()),
+            args: vec!["-e".into(), "./ext.ts".into()],
+            ..Default::default()
+        };
+        assert!(Pi.validate_model_for_access(&config, &options, None, Access::Build, &Stop::default()).is_ok());
+        assert!(Pi.validate_model_for_access(&config, &options, None, Access::Question, &Stop::default()).is_err());
+        assert!(Pi.validate_model_for_access(&config, &options, None, Access::CleanRoomQuestion, &Stop::default()).is_err());
     }
 }

@@ -1026,7 +1026,8 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
     }
     // An access mode this agent can't hold (Clean room, for one whose reads we can't check) is
     // refused before anything else starts.
-    if let Err(e) = adapter.validate_access(access_for(spec.builder.is_some(), spec.deep, spec.question)) {
+    let access = access_for(spec.builder.is_some(), spec.deep, spec.question);
+    if let Err(e) = adapter.validate_access(access) {
         let _ = tx.send(AgentEvent::Error { message: e.message, remediation: e.remediation, log: None });
         return nothing_done(&name);
     }
@@ -1045,7 +1046,7 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
         let _ = tx.send(event);
         return nothing_done(&name);
     }
-    if let Err(e) = adapter.validate_model(&spec.config, &spec.options, spec.project.as_deref(), stop) {
+    if let Err(e) = adapter.validate_model_for_access(&spec.config, &spec.options, spec.project.as_deref(), access, stop) {
         let event = if e.code == ErrorCode::Cancelled {
             AgentEvent::Status { text: "Stopped.".into() }
         } else {
