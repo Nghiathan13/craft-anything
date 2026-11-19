@@ -20,7 +20,7 @@ fn kind_of(request: &str, target: &TargetRef, stack: &str) -> &'static str {
 }
 fn brief(ws: &Workspace, k: &str, deep: bool, ghidra: bool, editor: Option<&Path>, assets: bool, extra: Option<&str>) -> String {
     let target_kind = kind(k);
-    let inspection = study::inspection_for(&ws.manifest.target, target_kind.as_ref());
+    let inspection = study::inspection_for(deep, &ws.manifest.target, target_kind.as_ref());
     super::brief(target_kind.as_ref(), &BriefCx { ws, deep, ghidra, editor, assets, image_model: None, sees_pictures: true, inspection }, extra)
 }
 fn refine(k: &str, check: &CheckResult) -> String {
@@ -685,7 +685,7 @@ fn said_to_look(text: &str) -> Option<&'static str> {
 fn a_builder_that_cant_see_is_never_sent_to_a_picture() {
     let sees_only = |ws: &Workspace, k: &str, deep: bool, assets: bool, sees_pictures: bool| {
         let target_kind = kind(k);
-        let inspection = study::inspection_for(&ws.manifest.target, target_kind.as_ref());
+        let inspection = study::inspection_for(deep, &ws.manifest.target, target_kind.as_ref());
         super::brief(target_kind.as_ref(), &BriefCx { ws, deep, ghidra: false, editor: None, assets, image_model: None, sees_pictures, inspection }, None)
     };
     let mut checked = 0;
@@ -3817,10 +3817,22 @@ fn deep_mode_tailors_study_prompts_and_decompiled_detection_by_target_kind() {
     std::fs::write(&apk, craft_anything_testkit::android::notes_apk()).unwrap();
     std::fs::write(&asar, craft_anything_testkit::electron::notes_app_asar()).unwrap();
 
+    let electron_dir = d.path().join("electron-with-pkg");
+    std::fs::create_dir_all(&electron_dir).unwrap();
+    let electron_exe = electron_dir.join("MyApp");
+    std::fs::write(&electron_exe, b"MZ\x90\x00").unwrap();
+    std::fs::write(electron_dir.join("package.json"), r#"{"main":"main.js"}"#).unwrap();
+    let plain_dir = d.path().join("native-only");
+    std::fs::create_dir_all(&plain_dir).unwrap();
+    let plain_exe = plain_dir.join("PlainApp");
+    std::fs::write(&plain_exe, b"MZ\x90\x00").unwrap();
+
     assert_eq!(detect_local_inspection(&managed, &managed), LocalInspection::Managed { il_only: true });
     assert_eq!(detect_local_inspection(&jar, &jar), LocalInspection::Java);
     assert_eq!(detect_local_inspection(&apk, &apk), LocalInspection::Android);
     assert_eq!(detect_local_inspection(&asar, &asar), LocalInspection::Electron);
+    assert_eq!(detect_local_inspection(&electron_exe, &electron_exe), LocalInspection::Electron);
+    assert_eq!(detect_local_inspection(&plain_exe, &plain_exe), LocalInspection::Native);
 
     assert!(!LocalInspection::Managed { il_only: true }.uses_ghidra());
     assert!(LocalInspection::Managed { il_only: false }.uses_ghidra());
@@ -3876,7 +3888,9 @@ fn deep_mode_tailors_study_prompts_and_decompiled_detection_by_target_kind() {
     assert!(tool_marks_decompiled("java_class_show", &json!({"decompile": true}), LocalInspection::Java));
     assert!(!tool_marks_decompiled("java_class_show", &json!({"decompile": false}), LocalInspection::Java));
     assert!(tool_marks_decompiled("android_method_show", &json!({}), LocalInspection::Android));
+    assert!(!tool_marks_decompiled("js_app_map", &json!({}), LocalInspection::Electron), "mapping modules does not count as inspecting source code");
     assert!(tool_marks_decompiled("js_sources_restore", &json!({}), LocalInspection::Electron));
+    assert!(tool_marks_decompiled("js_source_locate", &json!({}), LocalInspection::Electron));
 
     struct InspectsManaged(bool);
     impl Conversation for InspectsManaged {
@@ -3904,6 +3918,70 @@ fn deep_mode_tailors_study_prompts_and_decompiled_detection_by_target_kind() {
     assert!(!ws.manifest.decompiled, "listing managed members without IL does not count");
     w.turn(&mut ws, &mut InspectsManaged(true), "Build it.", true, None).unwrap();
     assert!(ws.manifest.decompiled, "reading managed IL marks the project decompiled");
+}
+
+#[test]
+fn clean_room_skips_target_inspection_on_brief_and_follow_up_turn() {
+    let d = tempfile::tempdir().unwrap();
+    let app_dir = d.path().join("electron-target");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    std::fs::write(app_dir.join("package.json"), r#"{"main":"main.js"}"#).unwrap();
+    let target = TargetRef::Local { path: app_dir };
+    let app_kind = kind("app");
+
+    assert_eq!(study::inspection_for(false, &target, app_kind.as_ref()), study::LocalInspection::Native);
+    assert_eq!(study::inspection_for(true, &target, app_kind.as_ref()), study::LocalInspection::Electron);
+
+    let mut ws = Workspace::create(d.path(), "App", "Rebuild it", target).unwrap();
+    let clean_brief = brief(&ws, "app", false, true, None, false, None);
+    assert!(clean_brief.contains("Clean room") && !clean_brief.contains("js_sources_restore") && !clean_brief.contains("managed_members_list"));
+
+    struct CallsElectronTool;
+    impl Conversation for CallsElectronTool {
+        fn send(&mut self, _text: &str) {}
+        fn poll(&mut self) -> Vec<AgentEvent> {
+            vec![
+                AgentEvent::ToolStarted { call_id: "1".into(), tool: "mcp__craft-anything__js_sources_restore".into(), input: json!({}) },
+                AgentEvent::TurnDone {
+                    backend: "test".into(),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    tokens_unknown: false,
+                    cost_usd: None,
+                    cost_is_estimate: false,
+                },
+            ]
+        }
+        fn answer_consent(&mut self, _call_id: &str, _allow: bool) {}
+        fn stop(&mut self) {}
+        fn is_busy(&self) -> bool {
+            false
+        }
+    }
+
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut w = Worker {
+        wake: Default::default(),
+        engine: Arc::new(Engine::new(craft_anything_engine::testing::session())),
+        tx,
+        stop: CancelToken::default(),
+        preview: Arc::default(),
+        seen: HashSet::new(),
+        inbox: Inbox::new(ws.inbox_dir()),
+        editor: None,
+        notes: Arc::default(),
+        feed: Arc::new(Mutex::new(feed::FeedLog::open(&ws))),
+        keys: crate::KeyStore::file_only(ws.root.join("keys.toml")),
+        kept_checks: Mutex::default(),
+        assets: false,
+        usage: None,
+        self_check: None,
+        reset_progress_after_notes: false,
+    };
+    w.turn(&mut ws, &mut CallsElectronTool, "Follow-up request", false, Some("initial".into())).unwrap();
+    assert!(!ws.manifest.decompiled, "Clean room follow-up turn must not classify or mark local inspection");
+    w.turn(&mut ws, &mut CallsElectronTool, "Deep follow-up", true, Some("initial".into())).unwrap();
+    assert!(ws.manifest.decompiled, "Deep follow-up turn classifies Electron target and marks decompiled");
 }
 
 #[test]

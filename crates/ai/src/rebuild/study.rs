@@ -25,7 +25,18 @@ impl LocalInspection {
 }
 
 fn packaged_js(root: &Path) -> bool {
-    root.join("resources/app.asar").is_file() || root.join("package.json").is_file()
+    root.join("resources/app.asar").exists() || root.join("package.json").exists()
+}
+
+/// Folder or `.asar` holding an app's JavaScript sources (beside `program` or at `path`).
+pub(super) fn js_package_input(path: &Path, program: &Path) -> Option<PathBuf> {
+    if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("asar")) || packaged_js(path) {
+        return Some(path.to_path_buf());
+    }
+    if program.is_file() {
+        return program.parent().filter(|dir| !dir.as_os_str().is_empty() && packaged_js(dir)).map(Path::to_path_buf);
+    }
+    None
 }
 
 fn extension_fallback(path: &Path) -> LocalInspection {
@@ -42,11 +53,7 @@ pub(super) fn detect_local_inspection(path: &Path, program: &Path) -> LocalInspe
     use craft_anything_engine::target::{Target, TargetKind};
     use craft_anything_formats::dotnet::pe::{COMIMAGE_FLAGS_ILONLY, parse_pe};
 
-    if is_electron_runtime(program)
-        || program.extension().is_some_and(|e| e.eq_ignore_ascii_case("asar"))
-        || path.extension().is_some_and(|e| e.eq_ignore_ascii_case("asar"))
-        || (path.is_dir() && packaged_js(path))
-    {
+    if is_electron_runtime(program) || js_package_input(path, program).is_some() || program.extension().is_some_and(|e| e.eq_ignore_ascii_case("asar")) {
         return LocalInspection::Electron;
     }
     if program.is_dir() {
@@ -68,7 +75,11 @@ pub(super) fn detect_local_inspection(path: &Path, program: &Path) -> LocalInspe
     }
 }
 
-pub(super) fn inspection_for_target(target: &TargetRef, studies_folder: bool) -> LocalInspection {
+/// Classify `target` for Deep mode; Clean room never inspects or reads the original target.
+pub(super) fn inspection_for_target(deep: bool, target: &TargetRef, studies_folder: bool) -> LocalInspection {
+    if !deep {
+        return LocalInspection::Native;
+    }
     let TargetRef::Local { path } = target else {
         return LocalInspection::Native;
     };
@@ -76,25 +87,36 @@ pub(super) fn inspection_for_target(target: &TargetRef, studies_folder: bool) ->
     detect_local_inspection(path, &program)
 }
 
-pub(super) fn inspection_for(target: &TargetRef, kind: &dyn TargetKind) -> LocalInspection {
-    inspection_for_target(target, kind.studies_folder())
+pub(super) fn inspection_for(deep: bool, target: &TargetRef, kind: &dyn TargetKind) -> LocalInspection {
+    inspection_for_target(deep, target, kind.studies_folder())
 }
+
+struct DecompileRule {
+    matches_kind: fn(LocalInspection) -> bool,
+    tool_id: &'static str,
+    required_true_flag: Option<&'static str>,
+}
+
+const DECOMPILE_RULES: &[DecompileRule] = &[
+    DecompileRule { matches_kind: |k| matches!(k, LocalInspection::Managed { .. }), tool_id: "managed_members_list", required_true_flag: Some("include_il") },
+    DecompileRule { matches_kind: |k| k == LocalInspection::Java, tool_id: "java_method_show", required_true_flag: None },
+    DecompileRule { matches_kind: |k| k == LocalInspection::Java, tool_id: "java_vineflower_decompile", required_true_flag: None },
+    DecompileRule { matches_kind: |k| k == LocalInspection::Java, tool_id: "java_class_show", required_true_flag: Some("decompile") },
+    DecompileRule { matches_kind: |k| k == LocalInspection::Android, tool_id: "android_method_show", required_true_flag: None },
+    DecompileRule { matches_kind: |k| k == LocalInspection::Android, tool_id: "android_jeb_decompile", required_true_flag: None },
+    DecompileRule { matches_kind: |k| k == LocalInspection::Android, tool_id: "android_dart_snapshot_show", required_true_flag: None },
+    DecompileRule { matches_kind: |k| k == LocalInspection::Electron, tool_id: "js_sources_restore", required_true_flag: None },
+    DecompileRule { matches_kind: |k| k == LocalInspection::Electron, tool_id: "js_source_locate", required_true_flag: None },
+];
 
 /// Whether a canonical Craft Anything tool call counts as deep code inspection for `inspection`.
 pub(super) fn tool_marks_decompiled(canonical_id: &str, input: &Value, inspection: LocalInspection) -> bool {
-    if canonical_id == craft_anything_engine::tools::native_function::PSEUDOCODE_TOOL {
-        return true;
-    }
-    let flag = |k: &str| input.get(k).and_then(Value::as_bool) == Some(true);
-    match inspection {
-        LocalInspection::Managed { .. } => matches!(canonical_id, "managed_members_list" if flag("include_il")),
-        LocalInspection::Java => {
-            canonical_id == "java_method_show" || canonical_id == "java_vineflower_decompile" || (canonical_id == "java_class_show" && flag("decompile"))
-        }
-        LocalInspection::Android => matches!(canonical_id, "android_method_show" | "android_jeb_decompile" | "android_dart_snapshot_show"),
-        LocalInspection::Electron => matches!(canonical_id, "js_sources_restore" | "js_source_locate" | "js_app_map"),
-        LocalInspection::Native | LocalInspection::ArchiveOrFolder => false,
-    }
+    canonical_id == craft_anything_engine::tools::native_function::PSEUDOCODE_TOOL
+        || DECOMPILE_RULES.iter().any(|rule| {
+            (rule.matches_kind)(inspection)
+                && rule.tool_id == canonical_id
+                && rule.required_true_flag.is_none_or(|flag| input.get(flag).and_then(Value::as_bool) == Some(true))
+        })
 }
 
 /// An Electron program is the Chromium and Node runtime, and analysing that takes hours: the app's
@@ -245,11 +267,7 @@ impl Worker {
                     notes.push_str(&inventory(&f));
                 }
                 // A program's app.asar or package.json sits beside it, so look in its folder too.
-                let js_root = if program.is_file() { program.parent().filter(|p| !p.as_os_str().is_empty()).map(Path::to_path_buf) } else { None };
-                let packaged = |root: &Path| root.join("resources/app.asar").exists() || root.join("package.json").exists();
-                let js_input =
-                    if path.extension().is_some_and(|e| e == "asar") || packaged(&path) { Some(path.clone()) } else { js_root.filter(|r| packaged(r)) };
-                if let Some(input) = js_input
+                if let Some(input) = js_package_input(&path, &program)
                     && let Ok(out) = self.call("js_app_map", json!({"input_path": input.display().to_string(), "limit": 50}))
                 {
                     notes.push_str("\n## JavaScript application\n\n");
